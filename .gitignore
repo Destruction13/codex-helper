@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec
+.env
+codex_helper.log

@@ -1,0 +1,3 @@
+keyboard
+paramiko
+PySide6
