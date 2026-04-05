@@ -100,12 +100,6 @@ CHATGPT_START_DELAY_SECONDS = 2.0
 CHATGPT_EMAIL_STEP_DELAY_SECONDS = 1.0
 CHATGPT_REGISTRATION_WATCH_TIMEOUT_SECONDS = 180.0
 CHATGPT_REGISTRATION_POLL_INTERVAL_SECONDS = 1.0
-CHATGPT_ACCOUNT_PASSWORD = "Ghoulkate198302"
-CHATGPT_ACCOUNT_NAME = "Deyman"
-CHATGPT_ACCOUNT_AGE = "26"
-CHATGPT_ACCOUNT_BIRTH_DAY = "13"
-CHATGPT_ACCOUNT_BIRTH_MONTH = "04"
-CHATGPT_ACCOUNT_BIRTH_YEAR = "2000"
 CHATGPT_PROFILE_STEP_DELAY_SECONDS = 2.0
 OMNIROUTE_PAGE_PATH = "/dashboard/providers/codex"
 OMNIROUTE_ADD_BUTTON_TEXTS = (
@@ -510,6 +504,13 @@ def completed_process_output(completed: subprocess.CompletedProcess[str]) -> str
     stderr = completed.stderr or ""
     combined = stderr if stderr.strip() else stdout
     return combined.strip()
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name, "")
+    if not value.strip():
+        raise RuntimeError(f"Missing {name} in .env. Use .env.example as a template.")
+    return value.strip()
 
 
 class ThreadingForwardServer(socketserver.ThreadingTCPServer):
@@ -1253,7 +1254,9 @@ class CodexApp(QWidget):
 
     def handle_registration_password_step_detected(self) -> None:
         def insert_password_and_submit() -> None:
-            self.text_bind_worker(CHATGPT_ACCOUNT_PASSWORD, "Registration password")
+            self.text_bind_worker(
+                require_env("CHATGPT_ACCOUNT_PASSWORD"), "Registration password"
+            )
             time.sleep(0.15)
             press_virtual_key(VK_RETURN)
 
@@ -1277,7 +1280,7 @@ class CodexApp(QWidget):
 
     def complete_profile_after_code(self) -> None:
         time.sleep(CHATGPT_PROFILE_STEP_DELAY_SECONDS)
-        self.text_bind_worker(CHATGPT_ACCOUNT_NAME, "Registration name")
+        self.text_bind_worker(require_env("CHATGPT_ACCOUNT_NAME"), "Registration name")
         time.sleep(0.2)
         press_virtual_key(VK_TAB)
         time.sleep(0.1)
@@ -1290,29 +1293,38 @@ class CodexApp(QWidget):
             return
 
         if has_yyyy:
-            self.text_bind_worker(CHATGPT_ACCOUNT_BIRTH_DAY, "Registration birth day")
-            time.sleep(0.1)
-            press_virtual_key(VK_TAB)
-            time.sleep(0.1)
             self.text_bind_worker(
-                CHATGPT_ACCOUNT_BIRTH_MONTH, "Registration birth month"
+                require_env("CHATGPT_ACCOUNT_BIRTH_DAY"), "Registration birth day"
             )
             time.sleep(0.1)
             press_virtual_key(VK_TAB)
             time.sleep(0.1)
-            self.text_bind_worker(CHATGPT_ACCOUNT_BIRTH_YEAR, "Registration birth year")
+            self.text_bind_worker(
+                require_env("CHATGPT_ACCOUNT_BIRTH_MONTH"),
+                "Registration birth month",
+            )
+            time.sleep(0.1)
+            press_virtual_key(VK_TAB)
+            time.sleep(0.1)
+            self.text_bind_worker(
+                require_env("CHATGPT_ACCOUNT_BIRTH_YEAR"), "Registration birth year"
+            )
             self.append_log("Detected YYYY date step. Inserted 13, 04, and 2000.")
         elif has_year_2026:
             press_virtual_key(VK_TAB)
             time.sleep(0.1)
             press_virtual_key(VK_TAB)
             time.sleep(0.1)
-            self.text_bind_worker(CHATGPT_ACCOUNT_BIRTH_YEAR, "Registration birth year")
+            self.text_bind_worker(
+                require_env("CHATGPT_ACCOUNT_BIRTH_YEAR"), "Registration birth year"
+            )
             self.append_log(
                 "Detected year-picker step with 2026. Inserted birth year 2000 after two Tabs."
             )
         else:
-            self.text_bind_worker(CHATGPT_ACCOUNT_AGE, "Registration age")
+            self.text_bind_worker(
+                require_env("CHATGPT_ACCOUNT_AGE"), "Registration age"
+            )
             self.append_log("Inserted age 26 on the profile step.")
 
         time.sleep(0.15)
@@ -1697,7 +1709,9 @@ exit 0
         raise RuntimeError("Timed out waiting for the Omniroute page state.")
 
     def submit_omniroute_password(self, process_id: int) -> None:
-        self.text_bind_worker(CHATGPT_ACCOUNT_PASSWORD, "Omniroute password")
+        self.text_bind_worker(
+            require_env("CHATGPT_ACCOUNT_PASSWORD"), "Omniroute password"
+        )
         time.sleep(0.15)
         press_virtual_key(VK_RETURN)
         self.signals.omniroute_status.emit("Omniroute: вставлен пароль")
