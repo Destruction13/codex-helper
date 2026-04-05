@@ -789,17 +789,15 @@ class CodexApp(QWidget):
         self.code_hotkey_edit = QKeySequenceEdit()
         self.login_imap_button = QPushButton("Login")
         self.logout_imap_button = QPushButton("Logout")
-        self.open_chatgpt_button = QPushButton("Open ChatGPT")
         self.reg_button = QPushButton("reg")
         self.stop_button = QPushButton("Stop")
         self.connect_server_button = QPushButton("Connect to server")
-        self.omniroute_button = QPushButton("Omniroute")
         self.open_logs_button = QPushButton("Open logs")
         self.bind_rows_widget = QWidget()
         self.bind_rows_layout = QVBoxLayout(self.bind_rows_widget)
         self.add_bind_button = QPushButton("Add K-Bind")
         self.save_binds_button = QPushButton("Save Binds")
-        self.log_output = QPlainTextEdit()
+        self.log_output: QPlainTextEdit | None = None
         self.tray_icon = QSystemTrayIcon(self)
 
         self.setup_ui()
@@ -892,11 +890,9 @@ class CodexApp(QWidget):
         self.plus_button.clicked.connect(self.increment_email)
         self.login_imap_button.clicked.connect(self.open_imap_login_dialog)
         self.logout_imap_button.clicked.connect(self.logout_imap_account)
-        self.open_chatgpt_button.clicked.connect(self.open_chatgpt_in_edge)
         self.reg_button.clicked.connect(self.handle_reg_button_clicked)
         self.stop_button.clicked.connect(self.handle_stop_button_clicked)
         self.connect_server_button.clicked.connect(self.handle_server_button_clicked)
-        self.omniroute_button.clicked.connect(self.handle_omniroute_button_clicked)
         self.open_logs_button.clicked.connect(self.open_logs_file)
         self.add_bind_button.clicked.connect(self.add_bind_row)
         self.save_binds_button.clicked.connect(self.save_text_binds)
@@ -1017,18 +1013,12 @@ class CodexApp(QWidget):
         self.reg_button.setEnabled(not self.reg_in_progress)
         self.stop_button.setEnabled(self.reg_automation_active or self.reg_in_progress)
         self.connect_server_button.setEnabled(not self.server_connection_in_progress)
-        self.omniroute_button.setEnabled(not self.omniroute_in_progress)
         if self.server_connection_in_progress:
             self.connect_server_button.setText("Connecting...")
         elif self.server_tunnel.is_active():
             self.connect_server_button.setText("Open server")
         else:
             self.connect_server_button.setText("Connect to server")
-
-        if self.omniroute_in_progress:
-            self.omniroute_button.setText("Omniroute...")
-        else:
-            self.omniroute_button.setText("Omniroute")
 
         if self.reg_in_progress:
             self.reg_button.setText("reg...")
