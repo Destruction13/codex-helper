@@ -5,8 +5,13 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+node_modules/
 build/
 dist/
+out/
 *.spec
+*.tsbuildinfo
 .env
 codex_helper.log
+temp-electron-app/
+temp-electron-ui/

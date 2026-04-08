@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Invalid Code Focus Test</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: #171717;
+      color: #f5f5f5;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #1f1f1f;
+    }
+    .card {
+      width: min(520px, calc(100vw - 32px));
+      padding: 32px;
+      border-radius: 24px;
+      background: #202020;
+      border: 1px solid #313131;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+      display: grid;
+      gap: 20px;
+    }
+    h1 {
+      margin: 0;
+      text-align: center;
+      font-size: 54px;
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+    }
+    .subtitle {
+      margin: 0;
+      text-align: center;
+      color: #d4d4d4;
+      line-height: 1.5;
+      font-size: 16px;
+    }
+    .email {
+      text-align: center;
+      color: #8ab4ff;
+      font-weight: 700;
+      font-size: 16px;
+    }
+    label {
+      display: grid;
+      gap: 8px;
+      color: #ff5a5a;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    input {
+      height: 58px;
+      border-radius: 18px;
+      border: 2px solid #ff3d3d;
+      background: #1b1b1b;
+      color: #ffffff;
+      font-size: 34px;
+      padding: 0 20px;
+      outline: none;
+      box-sizing: border-box;
+    }
+    input:focus {
+      box-shadow: 0 0 0 4px rgba(255, 61, 61, 0.18);
+    }
+    .error {
+      color: #ff3d3d;
+      font-weight: 700;
+      min-height: 22px;
+    }
+    .success {
+      color: #3ddc84;
+      font-weight: 700;
+      min-height: 22px;
+    }
+    .primary {
+      height: 58px;
+      border: 0;
+      border-radius: 999px;
+      background: #ffffff;
+      color: #111111;
+      font-size: 30px;
+      cursor: pointer;
+    }
+    .link {
+      text-align: center;
+      color: #ffffff;
+      font-size: 14px;
+    }
+    .link button {
+      color: #ffffff;
+      background: transparent;
+      border: 0;
+      text-decoration: underline;
+      cursor: pointer;
+      font: inherit;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .secondary {
+      height: 42px;
+      padding: 0 14px;
+      border-radius: 12px;
+      border: 1px solid #444;
+      background: #2a2a2a;
+      color: #f5f5f5;
+      cursor: pointer;
+    }
+    .log {
+      max-height: 170px;
+      overflow: auto;
+      border-top: 1px solid #313131;
+      padding-top: 16px;
+      color: #bcbcbc;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Проверьте свою почту</h1>
+    <p class="subtitle">Введите код подтверждения, который мы только что отправили на</p>
+    <div class="email">ghoulgpt+focus-test@zohomail.eu.</div>
+
+    <label>
+      Код
+      <input id="code-input" type="text" inputmode="numeric" maxlength="6" autocomplete="off" autofocus>
+    </label>
+
+    <div class="error" id="error-text"></div>
+    <div class="success" id="success-text"></div>
+    <div id="state-marker">STATE: READY</div>
+    <div id="latest-code-marker">LATEST_CODE: 000000</div>
+
+    <button class="primary" id="submit-button">Продолжить</button>
+
+    <div class="link"><button id="resend-button">Отправить электронное письмо повторно</button></div>
+
+    <div class="controls">
+      <button class="secondary" id="generate-code-button">Сгенерировать новый код</button>
+      <button class="secondary" id="reset-button">Сбросить сценарий</button>
+      <button class="secondary" id="focus-input-button">Фокус в поле</button>
+    </div>
+
+    <section class="log" id="event-log"></section>
+  </main>
+
+  <script>
+    const codeInput = document.getElementById('code-input');
+    const submitButton = document.getElementById('submit-button');
+    const resendButton = document.getElementById('resend-button');
+    const generateCodeButton = document.getElementById('generate-code-button');
+    const resetButton = document.getElementById('reset-button');
+    const focusInputButton = document.getElementById('focus-input-button');
+    const errorText = document.getElementById('error-text');
+    const successText = document.getElementById('success-text');
+    const eventLog = document.getElementById('event-log');
+    const stateMarker = document.getElementById('state-marker');
+    const latestCodeMarker = document.getElementById('latest-code-marker');
+
+    let validCode = makeCode();
+    let attemptCount = 0;
+
+    function makeCode() {
+      return String(Math.floor(100000 + Math.random() * 900000));
+    }
+
+    function log(message) {
+      const timestamp = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+      eventLog.textContent = `[${timestamp}] ${message}\n` + eventLog.textContent;
+    }
+
+    function resetState() {
+      errorText.textContent = '';
+      successText.textContent = '';
+      stateMarker.textContent = 'STATE: READY';
+      document.title = 'Invalid Code Focus Test - READY';
+      codeInput.value = '';
+      codeInput.focus();
+    }
+
+    function newCode(reason) {
+      validCode = makeCode();
+      latestCodeMarker.textContent = `LATEST_CODE: ${validCode}`;
+      log(`${reason}. Новый код: ${validCode}`);
+    }
+
+    function handleInvalidCode() {
+      errorText.textContent = 'Неправильный код';
+      successText.textContent = '';
+      stateMarker.textContent = 'STATE: INVALID_CODE';
+      document.title = 'Invalid Code Focus Test - INVALID_CODE';
+      submitButton.focus();
+      log('Код неверный. Фокус намеренно переведён на кнопку Продолжить.');
+      setTimeout(() => {
+        newCode('Сайт сгенерировал новый код после неверной попытки');
+      }, 2000);
+    }
+
+    function submitCode() {
+      attemptCount += 1;
+      const submitted = codeInput.value.trim();
+      log(`Попытка #${attemptCount}: отправлен код ${submitted || '<пусто>'}`);
+
+      if (submitted !== validCode) {
+        handleInvalidCode();
+        return;
+      }
+
+      errorText.textContent = '';
+      successText.textContent = 'Код принят. Сценарий retry можно считать успешным.';
+      stateMarker.textContent = 'STATE: SUCCESS';
+      document.title = 'Invalid Code Focus Test - SUCCESS';
+      log('Код принят.');
+    }
+
+    submitButton.addEventListener('click', submitCode);
+    resendButton.addEventListener('click', () => {
+      newCode('Нажата повторная отправка письма');
+      codeInput.focus();
+    });
+    generateCodeButton.addEventListener('click', () => newCode('Пользователь вручную создал новый код'));
+    resetButton.addEventListener('click', () => {
+      attemptCount = 0;
+      resetState();
+      newCode('Сценарий сброшен');
+    });
+    focusInputButton.addEventListener('click', () => {
+      codeInput.focus();
+      log('Фокус возвращён в поле кода вручную.');
+    });
+
+    codeInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitCode();
+      }
+    });
+
+    newCode('Старт тестового сценария');
+    codeInput.focus();
+  </script>
+</body>
+</html>

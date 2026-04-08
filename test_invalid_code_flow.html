@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Тест проверки кода</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: #111318;
+      color: #f5f7fb;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at top, #1c2130 0%, #111318 55%);
+    }
+
+    .shell {
+      width: min(560px, calc(100vw - 32px));
+      border: 1px solid #2c3346;
+      border-radius: 24px;
+      background: rgba(20, 24, 33, 0.96);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+      overflow: hidden;
+    }
+
+    .panel {
+      padding: 28px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .eyebrow {
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #8da0c7;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 36px;
+      line-height: 1.1;
+    }
+
+    p {
+      margin: 0;
+      color: #b8c2db;
+      line-height: 1.5;
+    }
+
+    .status {
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+      border-radius: 18px;
+      background: #171c27;
+      border: 1px solid #2c3346;
+    }
+
+    .status strong {
+      color: #7dd3fc;
+    }
+
+    .code-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 120px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: #0f1729;
+      color: #7dd3fc;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      border: 1px solid #29406c;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      font-size: 14px;
+      color: #dbe3f7;
+    }
+
+    input {
+      height: 54px;
+      border-radius: 16px;
+      border: 1px solid #33405c;
+      background: #0f131b;
+      color: #f5f7fb;
+      font-size: 24px;
+      letter-spacing: 0.2em;
+      text-align: center;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18);
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      height: 48px;
+      padding: 0 18px;
+      border-radius: 14px;
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .primary {
+      background: linear-gradient(135deg, #60a5fa, #7c3aed);
+      color: white;
+    }
+
+    .secondary {
+      background: #1b2230;
+      color: #dbe3f7;
+      border: 1px solid #33405c;
+    }
+
+    .error {
+      min-height: 22px;
+      color: #fb7185;
+      font-weight: 700;
+    }
+
+    .success {
+      color: #4ade80;
+      font-weight: 700;
+    }
+
+    .log {
+      max-height: 180px;
+      overflow: auto;
+      padding: 16px;
+      border-top: 1px solid #2c3346;
+      background: #0e1219;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      color: #b7c2da;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel">
+      <p class="eyebrow">Test Harness</p>
+      <h1>Проверьте свою почту</h1>
+      <p>Этот тестовый сайт имитирует сценарий, где первый код может быть неверным, после чего отправляется новый актуальный код.</p>
+
+      <div class="status">
+        <div><strong>Текущий валидный код:</strong> <span class="code-pill" id="current-code">000000</span></div>
+        <div><strong>Поведение:</strong> после неверного ввода сайт покажет <code>Неверный код</code>, очистит поле и через 2 секунды сгенерирует новый код.</div>
+      </div>
+
+      <label>
+        Введите код подтверждения
+        <input id="code-input" type="text" inputmode="numeric" maxlength="6" autocomplete="off" autofocus>
+      </label>
+
+      <div class="error" id="error-text"></div>
+
+      <div class="row">
+        <button class="primary" id="submit-button">Продолжить</button>
+        <button class="secondary" id="force-new-code">Сымитировать новый код</button>
+        <button class="secondary" id="reset-flow">Сбросить сценарий</button>
+      </div>
+
+      <div class="success" id="success-text"></div>
+    </section>
+
+    <section class="log" id="event-log"></section>
+  </main>
+
+  <script>
+    const currentCode = document.getElementById('current-code');
+    const codeInput = document.getElementById('code-input');
+    const errorText = document.getElementById('error-text');
+    const successText = document.getElementById('success-text');
+    const eventLog = document.getElementById('event-log');
+    const submitButton = document.getElementById('submit-button');
+    const forceNewCodeButton = document.getElementById('force-new-code');
+    const resetButton = document.getElementById('reset-flow');
+
+    let validCode = makeCode();
+    let attemptCount = 0;
+
+    function makeCode() {
+      return String(Math.floor(100000 + Math.random() * 900000));
+    }
+
+    function log(message) {
+      const timestamp = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+      eventLog.textContent = `[${timestamp}] ${message}\n` + eventLog.textContent;
+    }
+
+    function refreshCode(newCode, reason) {
+      validCode = newCode;
+      currentCode.textContent = validCode;
+      log(`${reason}. Новый валидный код: ${validCode}`);
+    }
+
+    function resetUiState() {
+      errorText.textContent = '';
+      successText.textContent = '';
+      codeInput.value = '';
+      codeInput.focus();
+    }
+
+    function scheduleNewCodeAfterFailure() {
+      log('Сайт принял код как неверный. Ждём 2 секунды и выдаём новый код.');
+      window.setTimeout(() => {
+        refreshCode(makeCode(), 'Сгенерирован новый код после ошибки');
+      }, 2000);
+    }
+
+    function submitCode() {
+      attemptCount += 1;
+      const submittedCode = codeInput.value.trim();
+      log(`Попытка #${attemptCount}: введён код ${submittedCode || '<пусто>'}`);
+
+      if (submittedCode !== validCode) {
+        errorText.textContent = 'Неверный код';
+        successText.textContent = '';
+        codeInput.value = '';
+        codeInput.focus();
+        scheduleNewCodeAfterFailure();
+        return;
+      }
+
+      errorText.textContent = '';
+      successText.textContent = 'Код принят. Проверка retry-логики пройдена.';
+      log('Код принят. Сайт разрешил перейти дальше.');
+    }
+
+    submitButton.addEventListener('click', submitCode);
+    forceNewCodeButton.addEventListener('click', () => {
+      resetUiState();
+      refreshCode(makeCode(), 'Пользователь вручную сымитировал новый код');
+    });
+    resetButton.addEventListener('click', () => {
+      attemptCount = 0;
+      resetUiState();
+      refreshCode(makeCode(), 'Сценарий сброшен');
+    });
+
+    codeInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitCode();
+      }
+    });
+
+    refreshCode(validCode, 'Старт тестового сценария');
+    codeInput.focus();
+  </script>
+</body>
+</html>

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from ctypes import wintypes
 from email import message_from_bytes
@@ -95,12 +96,23 @@ CHATGPT_CHECK_EMAIL_TEXTS = (
     "проверьте свою почту",
     "check your email",
 )
+CHATGPT_INVALID_CODE_TEXTS = (
+    "неправильный код",
+    "неверный код",
+    "invalid code",
+    "incorrect code",
+)
 CHATGPT_BUTTON_TIMEOUT_SECONDS = 15.0
 CHATGPT_START_DELAY_SECONDS = 2.0
 CHATGPT_EMAIL_STEP_DELAY_SECONDS = 1.0
 CHATGPT_REGISTRATION_WATCH_TIMEOUT_SECONDS = 180.0
 CHATGPT_REGISTRATION_POLL_INTERVAL_SECONDS = 1.0
 CHATGPT_PROFILE_STEP_DELAY_SECONDS = 2.0
+CHATGPT_STARTUP_GUARD_TIMEOUT_SECONDS = 15.0
+CHATGPT_FINISH_ACCOUNT_BUTTON_TEXTS = (
+    "Завершить создание учетной записи",
+    "Finish creating account",
+)
 OMNIROUTE_PAGE_PATH = "/dashboard/providers/codex"
 OMNIROUTE_ADD_BUTTON_TEXTS = (
     "+Add",
@@ -115,14 +127,29 @@ OMNIROUTE_CONTINUE_BUTTON_TEXTS = (
     "Продолжить",
     "Continue",
 )
+OMNIROUTE_INVALID_CODE_TEXTS = (
+    "неверный код",
+    "неверно",
+    "invalid code",
+    "incorrect code",
+)
+OMNIROUTE_REJECT_TEXTS = (
+    "давайте подтвердим ваш возраст",
+    "требуется номер телефона",
+)
 OMNIROUTE_PAGE_LOAD_DELAY_SECONDS = 0.3
 OMNIROUTE_STEP_TIMEOUT_SECONDS = 180.0
+OMNIROUTE_ADD_TIMEOUT_SECONDS = 20.0
+OMNIROUTE_POST_PASSWORD_TIMEOUT_SECONDS = 20.0
+CODE_WAIT_TIMEOUT_SECONDS = 30.0
+MAX_CODE_RESEND_ATTEMPTS = 2
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 VK_TAB = 0x09
 VK_SHIFT = 0x10
 VK_CONTROL = 0x11
+VK_BACK = 0x08
 VK_MENU = 0x12
 VK_RETURN = 0x0D
 VK_TAB = 0x09
@@ -513,6 +540,39 @@ def require_env(name: str) -> str:
     return value.strip()
 
 
+def append_traceback_to_log(
+    context: str, exc_info: tuple[type[BaseException], BaseException, Any]
+) -> None:
+    timestamp = time.strftime("%H:%M:%S")
+    formatted = "".join(traceback.format_exception(*exc_info)).rstrip()
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"[{timestamp}] {context}\n{formatted}\n")
+    except Exception:
+        pass
+
+
+def install_global_exception_logging() -> None:
+    def _sys_excepthook(
+        exc_type: type[BaseException], exc_value: BaseException, exc_traceback: Any
+    ) -> None:
+        append_traceback_to_log(
+            "UNHANDLED EXCEPTION",
+            (exc_type, exc_value, exc_traceback),
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+        append_traceback_to_log(
+            f"UNHANDLED THREAD EXCEPTION: {getattr(args.thread, 'name', 'unknown-thread')}",
+            (args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _sys_excepthook
+    threading.excepthook = _thread_excepthook
+
+
 class ThreadingForwardServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -740,6 +800,7 @@ class WorkerSignals(QObject):
     text_bind_requested = Signal(object)
     email_copy_requested = Signal()
     code_insert_requested = Signal()
+    inspect_window_requested = Signal()
     text_bind_error = Signal(str)
     text_bind_success = Signal(str)
     imap_code_received = Signal(str)
@@ -755,6 +816,7 @@ class WorkerSignals(QObject):
     registration_flow_completed = Signal()
     reg_cycle_finished = Signal()
     registration_post_submit = Signal()
+    code_wait_timeout = Signal(str, int)
 
 
 class CodexApp(QWidget):
@@ -765,6 +827,7 @@ class CodexApp(QWidget):
         self.bind_rows: list[KBindRow] = []
         self.email_hotkey_handle: Any | None = None
         self.code_hotkey_handle: Any | None = None
+        self.inspect_window_hotkey_handle: Any | None = None
         self.imap_stop_event = threading.Event()
         self.imap_thread: threading.Thread | None = None
         self.registration_watch_stop_event = threading.Event()
@@ -780,6 +843,15 @@ class CodexApp(QWidget):
         self.reg_automation_active = False
         self.chatgpt_edge_process_id = 0
         self.reuse_omniroute_browser = False
+        self.omniroute_restart_requested = False
+        self.code_submit_in_progress = False
+        self.code_wait_refocus_needed = False
+        self.code_wait_clear_before_submit = False
+        self.code_wait_generation = 0
+        self.code_wait_flow = ""
+        self.code_wait_process_id = 0
+        self.code_wait_attempts = 0
+        self.retry_hotkey_in_progress = False
 
         self.email_input = QLineEdit()
         self.email_hotkey_edit = QKeySequenceEdit()
@@ -899,6 +971,7 @@ class CodexApp(QWidget):
         self.email_input.textChanged.connect(self.handle_email_changed)
         self.signals.email_copy_requested.connect(self.copy_current_email_to_clipboard)
         self.signals.code_insert_requested.connect(self.insert_current_code)
+        self.signals.inspect_window_requested.connect(self.inspect_current_window)
         self.signals.text_bind_requested.connect(self.trigger_text_bind)
         self.signals.text_bind_error.connect(self.handle_text_bind_error)
         self.signals.text_bind_success.connect(self.handle_text_bind_success)
@@ -925,6 +998,7 @@ class CodexApp(QWidget):
         self.signals.registration_post_submit.connect(
             self.handle_registration_post_submit
         )
+        self.signals.code_wait_timeout.connect(self.handle_code_wait_timeout)
 
     def restore_state(self) -> None:
         saved_email = str(self.settings.value("email", "")).strip()
@@ -1118,6 +1192,9 @@ class CodexApp(QWidget):
         if self.code_hotkey_handle is not None:
             keyboard.remove_hotkey(self.code_hotkey_handle)
             self.code_hotkey_handle = None
+        if self.inspect_window_hotkey_handle is not None:
+            keyboard.remove_hotkey(self.inspect_window_hotkey_handle)
+            self.inspect_window_hotkey_handle = None
         for bind_row in self.bind_rows:
             if bind_row.handle is not None:
                 keyboard.remove_hotkey(bind_row.handle)
@@ -1139,6 +1216,11 @@ class CodexApp(QWidget):
                 self.signals.code_insert_requested.emit,
                 suppress=True,
             )
+        self.inspect_window_hotkey_handle = keyboard.add_hotkey(
+            "down",
+            self.signals.inspect_window_requested.emit,
+            suppress=True,
+        )
         for bind_row in self.bind_rows:
             hotkey = key_sequence_to_hotkey(bind_row.hotkey_edit.keySequence())
             text = bind_row.text_input.text()
@@ -1253,7 +1335,8 @@ class CodexApp(QWidget):
         self.awaiting_registration_code = True
         self.registration_code_baseline = self.current_code()
         self.pending_code_flow = "chatgpt"
-        self.pending_code_process_id = 0
+        self.pending_code_process_id = self.chatgpt_edge_process_id
+        self.start_code_wait("chatgpt", self.chatgpt_edge_process_id)
         threading.Thread(target=insert_password_and_submit, daemon=True).start()
         self.append_log(
             "Detected password step. Inserted password, submitted it, and waiting for a new verification code."
@@ -1263,7 +1346,8 @@ class CodexApp(QWidget):
         self.awaiting_registration_code = True
         self.registration_code_baseline = self.current_code()
         self.pending_code_flow = "chatgpt"
-        self.pending_code_process_id = 0
+        self.pending_code_process_id = self.chatgpt_edge_process_id
+        self.start_code_wait("chatgpt", self.chatgpt_edge_process_id)
         self.append_log(
             "Detected email verification step. Waiting for a new mail code and copying it when it arrives."
         )
@@ -1318,9 +1402,91 @@ class CodexApp(QWidget):
             self.append_log("Inserted age 26 on the profile step.")
 
         time.sleep(0.15)
-        press_virtual_key(VK_RETURN)
+        try:
+            matched_name = self.activate_finish_account_button()
+        except Exception:
+            press_virtual_key(VK_RETURN)
+        else:
+            self.append_log(f"Activated '{matched_name}' on the profile step.")
         self.append_log("Submitted the profile step.")
         self.signals.registration_post_submit.emit()
+
+    def wait_for_chatgpt_initial_next_step(self, process_id: int) -> str:
+        deadline = time.monotonic() + CHATGPT_STARTUP_GUARD_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            page_text = self.read_edge_window_text(process_id, timeout_seconds=1.0)
+            normalized_text = page_text.casefold()
+            if any(text in normalized_text for text in CHATGPT_CREATE_PASSWORD_TEXTS):
+                return "password"
+            if any(text in normalized_text for text in CHATGPT_CHECK_EMAIL_TEXTS):
+                return "email_check"
+            time.sleep(0.5)
+        raise RuntimeError("Timed out waiting for the next ChatGPT registration step.")
+
+    def wait_for_chatgpt_post_code_state(self, process_id: int) -> str:
+        deadline = time.monotonic() + CHATGPT_REGISTRATION_WATCH_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                page_text = self.read_edge_window_text(
+                    process_id,
+                    timeout_seconds=CHATGPT_REGISTRATION_POLL_INTERVAL_SECONDS,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"ChatGPT post-code watcher failed: {exc}") from exc
+
+            normalized_text = page_text.casefold()
+            if any(text in normalized_text for text in CHATGPT_INVALID_CODE_TEXTS):
+                return "invalid_code"
+            if not any(text in normalized_text for text in CHATGPT_CHECK_EMAIL_TEXTS):
+                return "continue"
+
+            time.sleep(CHATGPT_REGISTRATION_POLL_INTERVAL_SECONDS)
+
+        raise RuntimeError("Timed out waiting for ChatGPT post-code state.")
+
+    def handle_chatgpt_invalid_code(self, process_id: int) -> None:
+        self.append_log(
+            "ChatGPT: detected invalid code; clearing field and waiting for a new code"
+        )
+        self.focus_and_clear_chatgpt_code_field(process_id)
+        self.awaiting_registration_code = True
+        self.registration_code_baseline = self.current_code()
+        self.pending_code_flow = "chatgpt"
+        self.pending_code_process_id = process_id
+        self.start_code_wait("chatgpt", process_id, clear_before_submit=True)
+
+    def focus_and_clear_chatgpt_code_field(self, process_id: int) -> None:
+        self.activate_edge_element_by_name(
+            process_id,
+            "Код",
+            timeout_seconds=CHATGPT_BUTTON_TIMEOUT_SECONDS,
+            allow_tab_fallback=False,
+        )
+        release_modifier_keys()
+        time.sleep(0.05)
+        keyboard.press("ctrl")
+        keyboard.press_and_release("a")
+        keyboard.release("ctrl")
+        time.sleep(0.1)
+        for _ in range(6):
+            press_virtual_key(VK_BACK)
+            time.sleep(0.06)
+
+    def activate_finish_account_button(self) -> str:
+        last_error = ""
+        for button_text in CHATGPT_FINISH_ACCOUNT_BUTTON_TEXTS:
+            try:
+                self.activate_edge_element_by_name(
+                    0,
+                    button_text,
+                    timeout_seconds=3.0,
+                    allow_tab_fallback=False,
+                )
+                return button_text
+            except Exception as exc:
+                last_error = str(exc)
+
+        raise RuntimeError(last_error or "Finish account button was not found.")
 
     def copy_current_email_to_clipboard(self) -> None:
         email = self.current_email()
@@ -1345,6 +1511,192 @@ class CodexApp(QWidget):
             daemon=True,
         ).start()
 
+    def inspect_current_window(self) -> None:
+        if self.retry_hotkey_in_progress:
+            return
+        threading.Thread(target=self.inspect_current_window_worker, daemon=True).start()
+
+    def inspect_current_window_worker(self) -> None:
+        self.retry_hotkey_in_progress = True
+        try:
+            script = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class NativeWindowHelpers
+{
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+}
+"@
+
+$foreground = [NativeWindowHelpers]::GetForegroundWindow()
+if ($foreground -eq [IntPtr]::Zero) {
+    Write-Error 'Foreground window was not found.'
+    exit 1
+}
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($foreground)
+if (-not $root) {
+    Write-Error 'Automation root for foreground window was not found.'
+    exit 1
+}
+
+Write-Output '=== WINDOW ==='
+Write-Output ('Name: ' + $root.Current.Name)
+Write-Output ('ClassName: ' + $root.Current.ClassName)
+Write-Output ('AutomationId: ' + $root.Current.AutomationId)
+
+$allNodes = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+)
+
+Write-Output '=== TEXT NODES ==='
+for ($index = 0; $index -lt $allNodes.Count; $index++) {
+    $node = $allNodes.Item($index)
+    $name = $node.Current.Name
+    if (-not [string]::IsNullOrWhiteSpace($name)) {
+        try {
+            $controlType = $node.Current.ControlType.ProgrammaticName
+            $className = $node.Current.ClassName
+            $automationId = $node.Current.AutomationId
+            $bounds = $node.Current.BoundingRectangle
+            Write-Output ("TEXT|Name=" + $name + "|Type=" + $controlType + "|Class=" + $className + "|AutomationId=" + $automationId + "|Top=" + [int]$bounds.Top + "|Left=" + [int]$bounds.Left + "|Width=" + [int]$bounds.Width + "|Height=" + [int]$bounds.Height)
+        } catch {
+        }
+    }
+}
+
+$edits = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit
+    ))
+)
+
+Write-Output '=== EDIT CANDIDATES ==='
+if ($edits.Count -eq 0) {
+    Write-Output 'No edit fields found.'
+} else {
+    for ($index = 0; $index -lt $edits.Count; $index++) {
+        $edit = $edits.Item($index)
+        try {
+            $name = $edit.Current.Name
+            $className = $edit.Current.ClassName
+            $automationId = $edit.Current.AutomationId
+            $bounds = $edit.Current.BoundingRectangle
+            $hasValuePattern = $false
+            try {
+                $valuePattern = $null
+                $hasValuePattern = $edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)
+            } catch {
+            }
+            Write-Output ("EDIT|Index=" + $index + "|Name=" + $name + "|Class=" + $className + "|AutomationId=" + $automationId + "|Top=" + [int]$bounds.Top + "|Left=" + [int]$bounds.Left + "|Width=" + [int]$bounds.Width + "|Height=" + [int]$bounds.Height + "|HasValuePattern=" + $hasValuePattern)
+        } catch {
+        }
+    }
+}
+
+Write-Output '=== END ==='
+exit 0
+"""
+            completed = run_powershell_script(script, timeout_seconds=20.0)
+            output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+            if completed.returncode != 0:
+                self.append_log(f"Inspect hotkey failed: {output}")
+                return
+            try:
+                self.clipboard_text(output)
+            except Exception as exc:
+                self.append_log(
+                    f"Inspect hotkey: failed to copy inspection to clipboard: {exc}"
+                )
+            self.append_log("=== INSPECT OUTPUT START ===")
+            for line in output.splitlines():
+                self.append_log(line)
+            self.append_log("=== INSPECT OUTPUT END ===")
+            self.append_log(
+                "Inspect hotkey: inspection was written to logs and copied to clipboard if possible."
+            )
+        finally:
+            self.retry_hotkey_in_progress = False
+
+    def focus_first_edit_in_foreground_window(self) -> None:
+        script = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class NativeWindowHelpers
+{
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+}
+"@
+
+$foreground = [NativeWindowHelpers]::GetForegroundWindow()
+if ($foreground -eq [IntPtr]::Zero) {
+    Write-Error 'Foreground window was not found.'
+    exit 1
+}
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($foreground)
+if (-not $root) {
+    Write-Error 'Automation root for foreground window was not found.'
+    exit 1
+}
+
+$edits = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit
+    ))
+)
+
+if ($edits.Count -lt 1) {
+    Write-Error 'No edit field was found in the foreground window.'
+    exit 1
+}
+
+$targetEdit = $null
+for ($index = 0; $index -lt $edits.Count; $index++) {
+    $candidate = $edits.Item($index)
+    try {
+        $bounds = $candidate.Current.BoundingRectangle
+        if ($bounds.Top -gt 120) {
+            $targetEdit = $candidate
+            break
+        }
+    } catch {
+    }
+}
+
+if (-not $targetEdit) {
+    $targetEdit = $edits.Item(0)
+}
+
+$targetEdit.SetFocus()
+Start-Sleep -Milliseconds 150
+Write-Output 'focused'
+exit 0
+"""
+        completed = run_powershell_script(script, timeout_seconds=10.0)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed_process_output(completed)
+                or "Failed to focus the first edit field in the foreground window."
+            )
+
     def open_chatgpt_in_edge(self) -> None:
         threading.Thread(target=self.open_chatgpt_in_edge_worker, daemon=True).start()
 
@@ -1358,11 +1710,46 @@ class CodexApp(QWidget):
         self.append_log("reg: starting ChatGPT registration flow")
         self.open_chatgpt_in_edge()
 
+    def start_next_reg_cycle(self, *, reason: str) -> None:
+        if not self.reg_automation_active:
+            return
+        if self.reg_in_progress:
+            return
+
+        self.reg_in_progress = True
+        self.refresh_button_state()
+        self.append_log(reason)
+        self.open_chatgpt_in_edge()
+
     def handle_stop_button_clicked(self) -> None:
         self.reg_automation_active = False
         self.reg_in_progress = False
         self.refresh_button_state()
         self.append_log("reg: stop requested; no new cycle will be started")
+
+    def fail_current_iteration(self, reason: str) -> None:
+        self.append_log(f"reg: iteration failed: {reason}")
+        self.reset_pending_code_state()
+        self.omniroute_in_progress = False
+        self.server_connection_in_progress = False
+        self.reuse_omniroute_browser = False
+        self.omniroute_restart_requested = False
+        self.code_submit_in_progress = False
+
+        if self.reg_automation_active and self.reg_in_progress:
+            self.signals.reg_cycle_finished.emit()
+            self.reg_in_progress = False
+            self.refresh_button_state()
+            QTimer.singleShot(
+                0,
+                lambda: self.start_next_reg_cycle(
+                    reason=f"reg: continuing after failure ({reason})"
+                ),
+            )
+            return
+
+        self.reg_in_progress = False
+        self.refresh_button_state()
 
     def handle_server_button_clicked(self) -> None:
         if self.server_connection_in_progress:
@@ -1407,8 +1794,7 @@ class CodexApp(QWidget):
             self.close_chatgpt_edge_window()
         except Exception as exc:
             self.signals.imap_error.emit(f"Failed to close ChatGPT Edge window: {exc}")
-            self.reg_in_progress = False
-            self.refresh_button_state()
+            self.fail_current_iteration(f"Failed to close ChatGPT Edge window: {exc}")
             return
 
         self.signals.registration_flow_completed.emit()
@@ -1574,12 +1960,213 @@ exit 0
         self.registration_code_baseline = ""
         self.pending_code_flow = ""
         self.pending_code_process_id = 0
+        self.code_submit_in_progress = False
+        self.code_wait_generation += 1
+        self.code_wait_flow = ""
+        self.code_wait_process_id = 0
+        self.code_wait_attempts = 0
+        self.code_wait_refocus_needed = False
+        self.code_wait_clear_before_submit = False
 
-    def prepare_omniroute_code_wait(self, process_id: int) -> None:
+    def start_code_wait(
+        self,
+        flow: str,
+        process_id: int,
+        *,
+        clear_before_submit: bool = False,
+        reset_attempts: bool = True,
+    ) -> None:
+        self.code_wait_generation += 1
+        generation = self.code_wait_generation
+        self.code_wait_flow = flow
+        self.code_wait_process_id = process_id
+        if reset_attempts:
+            self.code_wait_attempts = 0
+        self.code_wait_refocus_needed = False
+        self.code_wait_clear_before_submit = clear_before_submit
+
+        def wait_worker() -> None:
+            while (
+                generation == self.code_wait_generation
+                and self.awaiting_registration_code
+            ):
+                time.sleep(CODE_WAIT_TIMEOUT_SECONDS)
+                if (
+                    generation != self.code_wait_generation
+                    or not self.awaiting_registration_code
+                ):
+                    return
+                self.signals.code_wait_timeout.emit(flow, generation)
+                return
+
+        threading.Thread(target=wait_worker, daemon=True).start()
+
+    def handle_code_wait_timeout(self, flow: str, generation: int) -> None:
+        if generation != self.code_wait_generation:
+            return
+        if not self.awaiting_registration_code:
+            return
+        if flow != self.code_wait_flow:
+            return
+
+        self.code_wait_attempts += 1
+        current_attempt = self.code_wait_attempts
+        process_id = self.code_wait_process_id
+        self.append_log(
+            f"{flow}: no code received after {int(CODE_WAIT_TIMEOUT_SECONDS)} seconds (attempt {current_attempt}/{MAX_CODE_RESEND_ATTEMPTS})"
+        )
+
+        try:
+            current_page_state = self.inspect_current_code_wait_page(flow, process_id)
+        except Exception as exc:
+            self.append_log(f"{flow}: failed to inspect current code-wait page: {exc}")
+            current_page_state = "unknown"
+
+        if current_page_state == "reject":
+            self.awaiting_registration_code = False
+            self.append_log(f"{flow}: page changed to reject state before resend.")
+            if flow == "omniroute":
+                try:
+                    self.handle_omniroute_reject(process_id)
+                except Exception as exc:
+                    self.signals.omniroute_failed.emit(str(exc))
+                    return
+                self.signals.omniroute_finished.emit()
+            return
+
+        if current_page_state == "continue":
+            self.awaiting_registration_code = False
+            self.append_log(
+                f"{flow}: page already reached continue state before resend."
+            )
+            if flow == "omniroute":
+                self.signals.omniroute_finished.emit()
+            return
+
+        if current_page_state == "other":
+            self.awaiting_registration_code = False
+            self.append_log(
+                f"{flow}: page left the code step before resend. Continuing without another wait cycle."
+            )
+            if flow == "omniroute":
+                self.signals.omniroute_failed.emit(
+                    "OmniRoute left the code step unexpectedly."
+                )
+            return
+
+        if current_attempt <= MAX_CODE_RESEND_ATTEMPTS:
+            try:
+                self.click_resend_email_button(flow, process_id)
+            except Exception as exc:
+                self.append_log(f"{flow}: resend click failed: {exc}")
+            else:
+                self.append_log(f"{flow}: requested a new code by clicking resend")
+            self.code_wait_refocus_needed = True
+            self.start_code_wait(flow, process_id, reset_attempts=False)
+            self.code_wait_refocus_needed = True
+            return
+
+        self.awaiting_registration_code = False
+        self.append_log(
+            f"{flow}: no code received after resend limit; continuing with failover"
+        )
+        if flow == "omniroute":
+            try:
+                self.handle_omniroute_reject(process_id)
+            except Exception as exc:
+                self.signals.omniroute_failed.emit(str(exc))
+                return
+            self.signals.omniroute_finished.emit()
+            return
+
+        if flow == "chatgpt":
+            try:
+                self.close_chatgpt_edge_window()
+            except Exception as exc:
+                self.append_log(
+                    f"chatgpt: failed to close Edge after resend limit: {exc}"
+                )
+            if self.reg_automation_active:
+                self.fail_current_iteration(
+                    "ChatGPT did not receive a code after resend limit"
+                )
+            return
+
+    def click_resend_email_button(self, flow: str, process_id: int) -> None:
+        if flow == "chatgpt":
+            self.activate_edge_element_by_name(
+                process_id,
+                "Отправить электронное письмо повторно",
+                timeout_seconds=CHATGPT_BUTTON_TIMEOUT_SECONDS,
+                allow_tab_fallback=False,
+            )
+            return
+
+        process_filter = "$window = Get-Process browser -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime -Descending | Select-Object -First 1"
+        not_found_message = "Yandex browser window was not found for resend."
+
+        script = """
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName Microsoft.VisualBasic
+Add-Type -AssemblyName System.Windows.Forms
+
+{process_filter}
+
+if (-not $window) {{
+    Write-Error '{not_found_message}'
+    exit 1
+}}
+
+[void][Microsoft.VisualBasic.Interaction]::AppActivate($window.Id)
+Start-Sleep -Milliseconds 300
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($window.MainWindowHandle)
+if (-not $root) {
+    Write-Error 'Automation root was not found for resend.'
+    exit 1
+}
+
+$nodes = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+)
+
+for ($index = 0; $index -lt $nodes.Count; $index++) {
+    $node = $nodes.Item($index)
+    $name = $node.Current.Name
+    if (-not [string]::IsNullOrWhiteSpace($name) -and $name.ToLower().Contains('повторно')) {
+        try {
+            $node.SetFocus()
+            Start-Sleep -Milliseconds 150
+            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+            Write-Output "clicked:$name"
+            exit 0
+        } catch {
+        }
+    }
+}
+
+Write-Error 'Resend button containing "повторно" was not found.'
+exit 1
+""".format(process_filter=process_filter, not_found_message=not_found_message)
+        completed = run_powershell_script(script, timeout_seconds=15.0)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed_process_output(completed) or "Failed to click resend button."
+            )
+
+    def prepare_omniroute_code_wait(
+        self, process_id: int, *, clear_before_submit: bool = False
+    ) -> None:
         self.awaiting_registration_code = True
         self.registration_code_baseline = self.current_code()
         self.pending_code_flow = "omniroute"
         self.pending_code_process_id = process_id
+        self.start_code_wait(
+            "omniroute", process_id, clear_before_submit=clear_before_submit
+        )
         self.signals.omniroute_status.emit("Omniroute: ожидаем новый код из почты")
         self.signals.omniroute_status.emit(
             "Omniroute is waiting for a new mail code and will submit it automatically."
@@ -1688,6 +2275,8 @@ exit 0
                 return "password"
             if any(text in normalized_text for text in OMNIROUTE_CHECK_EMAIL_TEXTS):
                 return "email_check"
+            if any(text in normalized_text for text in OMNIROUTE_REJECT_TEXTS):
+                return "reject"
             if allow_continue and any(
                 text.casefold() in normalized_text
                 for text in OMNIROUTE_CONTINUE_BUTTON_TEXTS
@@ -1697,6 +2286,62 @@ exit 0
             time.sleep(CHATGPT_REGISTRATION_POLL_INTERVAL_SECONDS)
 
         raise RuntimeError("Timed out waiting for the Omniroute page state.")
+
+    def detect_omniroute_post_password_step(self, process_id: int) -> str:
+        deadline = time.monotonic() + OMNIROUTE_POST_PASSWORD_TIMEOUT_SECONDS
+        seen_password_state = False
+
+        while time.monotonic() < deadline:
+            page_text = self.read_edge_window_text(process_id, timeout_seconds=1.0)
+            normalized_text = page_text.casefold()
+
+            if any(text in normalized_text for text in OMNIROUTE_PASSWORD_STEP_TEXTS):
+                seen_password_state = True
+                time.sleep(0.5)
+                continue
+
+            if seen_password_state:
+                if any(text in normalized_text for text in OMNIROUTE_CHECK_EMAIL_TEXTS):
+                    return "email_check"
+                if any(text in normalized_text for text in OMNIROUTE_REJECT_TEXTS):
+                    return "reject"
+                if any(
+                    text.casefold() in normalized_text
+                    for text in OMNIROUTE_CONTINUE_BUTTON_TEXTS
+                ) and not any(
+                    text in normalized_text for text in OMNIROUTE_CHECK_EMAIL_TEXTS
+                ):
+                    return "continue"
+
+            time.sleep(0.5)
+
+        raise RuntimeError("Timed out waiting for OmniRoute post-password transition.")
+
+    def inspect_current_code_wait_page(self, flow: str, process_id: int) -> str:
+        page_text = self.read_edge_window_text(process_id, timeout_seconds=2.0)
+        normalized_text = page_text.casefold()
+
+        if flow == "omniroute":
+            if any(text in normalized_text for text in OMNIROUTE_INVALID_CODE_TEXTS):
+                return "invalid_code"
+            if any(text in normalized_text for text in OMNIROUTE_CHECK_EMAIL_TEXTS):
+                return "email_check"
+            if any(text in normalized_text for text in OMNIROUTE_REJECT_TEXTS):
+                return "reject"
+            if any(
+                text.casefold() in normalized_text
+                for text in OMNIROUTE_CONTINUE_BUTTON_TEXTS
+            ) and not any(
+                text in normalized_text for text in OMNIROUTE_CHECK_EMAIL_TEXTS
+            ):
+                return "continue"
+            return "other"
+
+        if any(text in normalized_text for text in CHATGPT_INVALID_CODE_TEXTS):
+            return "invalid_code"
+        if any(text in normalized_text for text in CHATGPT_CHECK_EMAIL_TEXTS):
+            return "email_check"
+        return "other"
 
     def submit_omniroute_password(self, process_id: int) -> None:
         self.text_bind_worker(
@@ -1712,6 +2357,12 @@ exit 0
     def complete_omniroute_after_code(self, process_id: int) -> None:
         self.signals.omniroute_status.emit("Omniroute: вставлен код")
         matched_name = self.wait_for_omniroute_continue(process_id)
+        if matched_name == "reject":
+            self.handle_omniroute_reject(process_id)
+            return
+        if matched_name == "invalid_code":
+            self.handle_omniroute_invalid_code(process_id)
+            return
         self.signals.omniroute_status.emit(
             'Omniroute: найден финальный шаг "Продолжить"'
         )
@@ -1749,6 +2400,10 @@ exit 0
                     )
 
             normalized_text = page_text.casefold()
+            if any(text in normalized_text for text in OMNIROUTE_INVALID_CODE_TEXTS):
+                return "invalid_code"
+            if any(text in normalized_text for text in OMNIROUTE_REJECT_TEXTS):
+                return "reject"
             if any(
                 text.casefold() in normalized_text
                 for text in OMNIROUTE_CONTINUE_BUTTON_TEXTS
@@ -1760,6 +2415,288 @@ exit 0
             time.sleep(CHATGPT_REGISTRATION_POLL_INTERVAL_SECONDS)
 
         raise RuntimeError("Timed out waiting for the final continue step.")
+
+    def handle_omniroute_invalid_code(self, process_id: int) -> None:
+        self.signals.omniroute_status.emit(
+            "Omniroute: detected invalid code; clearing field and waiting for a new code"
+        )
+        self.focus_and_clear_active_code_field("omniroute")
+        self.prepare_omniroute_code_wait(process_id, clear_before_submit=True)
+
+    def build_edge_process_filter(self, process_id: int) -> str:
+        return f"$window = Get-Process -Id {process_id} -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowHandle -ne 0 }} | Select-Object -First 1"
+
+    def wait_for_omniroute_provider_page_ready(self, process_id: int) -> None:
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            page_text = self.read_edge_window_text(process_id, timeout_seconds=1.0)
+            normalized_text = page_text.casefold()
+            if "openai codex" in normalized_text or "connections" in normalized_text:
+                self.signals.omniroute_status.emit(
+                    "Omniroute: provider page is ready for Add search"
+                )
+                return
+            time.sleep(0.2)
+        raise RuntimeError("Timed out waiting for OmniRoute provider page readiness.")
+
+    def focus_and_clear_active_code_field(self, flow: str) -> None:
+        if flow == "chatgpt":
+            process_filter = self.build_edge_process_filter(self.code_wait_process_id)
+            not_found_message = (
+                "Edge window was not found while clearing the code field."
+            )
+        else:
+            process_filter = "$window = Get-Process browser -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime -Descending | Select-Object -First 1"
+            not_found_message = (
+                "Yandex browser window was not found while clearing the code field."
+            )
+
+        script = """
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName Microsoft.VisualBasic
+Add-Type -AssemblyName System.Windows.Forms
+
+{process_filter}
+
+if (-not $window) {{
+    Write-Error '{not_found_message}'
+    exit 1
+}}
+
+[void][Microsoft.VisualBasic.Interaction]::AppActivate($window.Id)
+Start-Sleep -Milliseconds 300
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($window.MainWindowHandle)
+if (-not $root) {
+    Write-Error 'Automation root was not found while clearing the code field.'
+    exit 1
+}
+
+$edits = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit
+    ))
+)
+
+if ($edits.Count -lt 1) {
+    Write-Error 'Edit field was not found while clearing the code field.'
+    exit 1
+}
+
+$targetEdit = $edits.Item(0)
+try {
+    $targetEdit.SetFocus()
+    Start-Sleep -Milliseconds 150
+} catch {
+    Write-Error 'Failed to focus the code field.'
+    exit 1
+}
+
+try {
+    $valuePattern = $null
+    if ($targetEdit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)) {
+        $valuePattern.SetValue('')
+        Start-Sleep -Milliseconds 150
+        Write-Output 'cleared:value-pattern'
+        exit 0
+    }
+} catch {
+}
+
+[System.Windows.Forms.SendKeys]::SendWait('{{END}}')
+Start-Sleep -Milliseconds 100
+for ($index = 0; $index -lt 6; $index++) {{
+    [System.Windows.Forms.SendKeys]::SendWait('{{BACKSPACE}}')
+    Start-Sleep -Milliseconds 60
+}}
+
+Write-Output 'cleared:fallback'
+exit 0
+""".format(process_filter=process_filter, not_found_message=not_found_message)
+        completed = run_powershell_script(script, timeout_seconds=15.0)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed_process_output(completed)
+                or "Failed to focus and clear the active code field."
+            )
+
+    def focus_active_code_field(self, flow: str) -> None:
+        if flow == "chatgpt":
+            if self.code_wait_process_id:
+                process_filter = self.build_edge_process_filter(
+                    self.code_wait_process_id
+                )
+            else:
+                process_filter = "$window = Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and -not [string]::IsNullOrWhiteSpace($_.MainWindowTitle) -and $_.MainWindowTitle -match 'OpenAI' } | Sort-Object StartTime -Descending | Select-Object -First 1"
+            not_found_message = (
+                "Edge window was not found while focusing the code field."
+            )
+        else:
+            process_filter = "$window = Get-Process browser -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime -Descending | Select-Object -First 1"
+            not_found_message = (
+                "Browser window was not found while focusing the code field."
+            )
+
+        script = """
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName Microsoft.VisualBasic
+
+{process_filter}
+
+if (-not $window) {{
+    Write-Error '{not_found_message}'
+    exit 1
+}}
+
+[void][Microsoft.VisualBasic.Interaction]::AppActivate($window.Id)
+Start-Sleep -Milliseconds 300
+
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($window.MainWindowHandle)
+if (-not $root) {
+    Write-Error 'Automation root was not found while focusing the code field.'
+    exit 1
+}
+
+$edits = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit
+    ))
+)
+
+if ($edits.Count -lt 1) {
+    Write-Error 'Edit field was not found while focusing the code field.'
+    exit 1
+}
+
+$targetEdit = $null
+for ($index = 0; $index -lt $edits.Count; $index++) {{
+    $candidate = $edits.Item($index)
+    try {{
+        $name = $candidate.Current.Name
+        $automationId = $candidate.Current.AutomationId
+        if ($name -eq 'Код' -or $automationId.EndsWith('-code')) {{
+            $targetEdit = $candidate
+            break
+        }}
+    }} catch {{
+    }}
+}}
+
+if (-not $targetEdit) {{
+    $targetEdit = $edits.Item(0)
+}}
+
+$targetEdit.SetFocus()
+Start-Sleep -Milliseconds 150
+Write-Output 'focused'
+exit 0
+""".format(process_filter=process_filter, not_found_message=not_found_message)
+        completed = run_powershell_script(script, timeout_seconds=15.0)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed_process_output(completed)
+                or "Failed to focus the active code field."
+            )
+
+    def handle_omniroute_reject(self, process_id: int) -> None:
+        self.signals.omniroute_status.emit(
+            "Omniroute: detected age/phone verification requirement; restarting cycle"
+        )
+        self.omniroute_restart_requested = True
+        self.try_close_active_yandex_tab(
+            "Yandex provider tab",
+            expect_title_fragment="OpenAI",
+        )
+        self.try_close_active_yandex_tab(
+            "OmniRoute base tab",
+            expect_title_fragment="OmniRoute",
+        )
+        self.reuse_omniroute_browser = False
+
+    def try_close_active_yandex_tab(
+        self, label: str, *, expect_title_fragment: str
+    ) -> None:
+        try:
+            self.close_active_yandex_tab(
+                label, expect_title_fragment=expect_title_fragment
+            )
+        except Exception as exc:
+            self.signals.omniroute_status.emit(
+                f"Omniroute: failed to close {label}: {exc}. Continuing with a fresh cycle."
+            )
+
+    def close_active_yandex_tab(
+        self, label: str, *, expect_title_fragment: str
+    ) -> None:
+        expected_title = expect_title_fragment.replace("'", "''")
+        script = f"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName Microsoft.VisualBasic
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class NativeKeyboard
+{{
+    [DllImport("user32.dll")]
+    public static extern void keybd_event(byte bVk, byte bScan, int dwFlags, int dwExtraInfo);
+}}
+"@
+$target = Get-Process browser -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.MainWindowHandle -ne 0 }} |
+    Sort-Object StartTime -Descending |
+    Select-Object -First 1
+
+if (-not $target) {{
+    Write-Error 'Active Yandex browser window was not found.'
+    exit 1
+}}
+
+$beforeTitle = $target.MainWindowTitle
+if ([string]::IsNullOrWhiteSpace($beforeTitle) -or $beforeTitle -notmatch '{expected_title}') {{
+    Write-Error "Unexpected active Yandex tab title: $beforeTitle"
+    exit 1
+}}
+
+[void][Microsoft.VisualBasic.Interaction]::AppActivate($target.Id)
+Start-Sleep -Milliseconds 300
+Add-Type -AssemblyName System.Windows.Forms
+[NativeKeyboard]::keybd_event(0x11, 0, 0, 0)
+Start-Sleep -Milliseconds 50
+[NativeKeyboard]::keybd_event(0x57, 0, 0, 0)
+Start-Sleep -Milliseconds 50
+[NativeKeyboard]::keybd_event(0x57, 0, 2, 0)
+Start-Sleep -Milliseconds 50
+[NativeKeyboard]::keybd_event(0x11, 0, 2, 0)
+Start-Sleep -Seconds 2
+
+$after = Get-Process browser -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.MainWindowHandle -ne 0 }} |
+    Sort-Object StartTime -Descending |
+    Select-Object -First 1
+
+if ($after -and $after.MainWindowTitle -eq $beforeTitle) {{
+    Write-Error 'Yandex tab title did not change after Ctrl+W.'
+    exit 1
+}}
+
+Write-Output 'closed-tab'
+exit 0
+"""
+        completed = run_powershell_script(script, timeout_seconds=10.0)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed_process_output(completed) or f"Failed to close {label}."
+            )
+        self.signals.omniroute_status.emit(f"Omniroute: closed {label}")
 
     def run_omniroute_worker(self) -> None:
         try:
@@ -1773,16 +2710,53 @@ exit 0
                 self.signals.omniroute_status.emit(
                     "Omniroute: reusing existing browser tab"
                 )
-                process_id = self.reuse_omniroute_browser_window()
+                try:
+                    process_id = self.reuse_omniroute_browser_window()
+                except Exception as exc:
+                    self.reuse_omniroute_browser = False
+                    self.signals.omniroute_status.emit(
+                        f"Omniroute: reuse failed ({exc}). Opening a fresh OmniRoute tab."
+                    )
+                    process_id = self.open_omniroute_in_browser()
             else:
                 process_id = self.open_omniroute_in_browser()
+                try:
+                    self.wait_for_omniroute_provider_page_ready(process_id)
+                except Exception as exc:
+                    self.signals.omniroute_status.emit(
+                        f"Omniroute: provider readiness pre-check failed ({exc}). Reopening a fresh OmniRoute tab before Add search."
+                    )
+                    process_id = self.open_omniroute_in_browser()
+                    try:
+                        self.wait_for_omniroute_provider_page_ready(process_id)
+                    except Exception:
+                        pass
             self.signals.omniroute_status.emit("Omniroute: начался поиск Add")
-            matched_add_button = self.activate_edge_element_by_names(
-                process_id,
-                OMNIROUTE_ADD_BUTTON_TEXTS,
-                timeout_seconds=CHATGPT_BUTTON_TIMEOUT_SECONDS,
-                allow_tab_fallback=False,
-            )
+            try:
+                matched_add_button = self.activate_edge_element_by_names(
+                    process_id,
+                    OMNIROUTE_ADD_BUTTON_TEXTS,
+                    timeout_seconds=OMNIROUTE_ADD_TIMEOUT_SECONDS,
+                    allow_tab_fallback=False,
+                )
+            except Exception:
+                if self.reg_automation_active and not self.reuse_omniroute_browser:
+                    self.signals.omniroute_status.emit(
+                        "Omniroute: first Add attempt failed, reopening a fresh tab and retrying once."
+                    )
+                    process_id = self.open_omniroute_in_browser()
+                    try:
+                        self.wait_for_omniroute_provider_page_ready(process_id)
+                    except Exception:
+                        pass
+                    matched_add_button = self.activate_edge_element_by_names(
+                        process_id,
+                        OMNIROUTE_ADD_BUTTON_TEXTS,
+                        timeout_seconds=OMNIROUTE_ADD_TIMEOUT_SECONDS,
+                        allow_tab_fallback=False,
+                    )
+                else:
+                    raise
             self.signals.omniroute_status.emit(
                 f"Omniroute: найдена кнопка {matched_add_button}"
             )
@@ -1809,12 +2783,47 @@ exit 0
             if current_step == "password":
                 self.signals.omniroute_status.emit("Omniroute: найден шаг пароля")
                 self.submit_omniroute_password(process_id)
-                self.prepare_omniroute_code_wait(process_id)
-                return
+                next_step = self.detect_omniroute_post_password_step(process_id)
+                if next_step == "email_check":
+                    self.prepare_omniroute_code_wait(process_id)
+                    return
+                if next_step == "reject":
+                    self.handle_omniroute_reject(process_id)
+                    return
+                if next_step == "continue":
+                    matched_continue_button = self.activate_edge_element_by_names(
+                        process_id,
+                        OMNIROUTE_CONTINUE_BUTTON_TEXTS,
+                        timeout_seconds=CHATGPT_BUTTON_TIMEOUT_SECONDS,
+                        allow_tab_fallback=False,
+                    )
+                    self.signals.omniroute_status.emit(
+                        f"Omniroute activated '{matched_continue_button}'."
+                    )
+                    return
+                raise RuntimeError(
+                    f"Unsupported OmniRoute state after password submit: {next_step}"
+                )
 
             if current_step == "email_check":
                 self.signals.omniroute_status.emit("Omniroute: найден шаг кода")
                 self.prepare_omniroute_code_wait(process_id)
+                return
+
+            if current_step == "reject":
+                self.handle_omniroute_reject(process_id)
+                return
+
+            if current_step == "continue":
+                matched_continue_button = self.activate_edge_element_by_names(
+                    process_id,
+                    OMNIROUTE_CONTINUE_BUTTON_TEXTS,
+                    timeout_seconds=CHATGPT_BUTTON_TIMEOUT_SECONDS,
+                    allow_tab_fallback=False,
+                )
+                self.signals.omniroute_status.emit(
+                    f"Omniroute activated '{matched_continue_button}'."
+                )
                 return
 
             raise RuntimeError(f"Unsupported Omniroute state: {current_step}")
@@ -1839,27 +2848,47 @@ exit 0
         self.show_error("Server connection failed", message)
 
     def handle_omniroute_failed(self, message: str) -> None:
+        self.append_log(f"Omniroute failed: {message}")
+        if self.reg_automation_active:
+            self.fail_current_iteration(f"Omniroute failed: {message}")
+            return
         self.reset_pending_code_state()
         self.omniroute_in_progress = False
         self.reg_in_progress = False
-        self.reg_automation_active = False
         self.reuse_omniroute_browser = False
+        self.omniroute_restart_requested = False
         self.refresh_button_state()
-        self.append_log(f"Omniroute failed: {message}")
         self.show_error("Omniroute failed", message)
 
     def handle_omniroute_finished(self) -> None:
         self.omniroute_in_progress = False
         should_increment_alias = self.reg_in_progress
-        should_repeat_cycle = self.reg_automation_active and self.reg_in_progress
-        self.reuse_omniroute_browser = True
+        restart_after_reject = (
+            self.reg_automation_active and self.omniroute_restart_requested
+        )
+        should_repeat_cycle = (
+            self.reg_automation_active
+            and self.reg_in_progress
+            and not self.omniroute_restart_requested
+        )
+        self.reuse_omniroute_browser = not restart_after_reject
         self.reg_in_progress = False
         self.refresh_button_state()
         if should_increment_alias:
             self.signals.reg_cycle_finished.emit()
+        if restart_after_reject:
+            QTimer.singleShot(
+                0,
+                lambda: self.start_next_reg_cycle(
+                    reason="reg: restarting cycle after Omniroute rejection"
+                ),
+            )
         if should_repeat_cycle:
-            self.append_log("reg: starting next cycle")
-            QTimer.singleShot(0, self.handle_reg_button_clicked)
+            QTimer.singleShot(
+                0,
+                lambda: self.start_next_reg_cycle(reason="reg: starting next cycle"),
+            )
+        self.omniroute_restart_requested = False
 
     def open_chatgpt_in_edge_worker(self) -> None:
         try:
@@ -1868,25 +2897,55 @@ exit 0
                 raise ValueError("Enter an email before opening ChatGPT.")
 
             edge_executable = self.resolve_edge_executable()
-            edge_process = subprocess.Popen(
-                [edge_executable, "--inprivate", "--start-maximized", CHATGPT_URL],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.chatgpt_edge_process_id = edge_process.pid
-            time.sleep(CHATGPT_START_DELAY_SECONDS)
-            self.activate_edge_element_by_name(
-                edge_process.pid,
-                CHATGPT_SIGNUP_BUTTON_TEXT,
-                timeout_seconds=CHATGPT_BUTTON_TIMEOUT_SECONDS,
-            )
-            time.sleep(CHATGPT_EMAIL_STEP_DELAY_SECONDS)
-            release_modifier_keys()
-            send_unicode_text(email)
-            press_virtual_key(VK_RETURN)
-            self.start_registration_watch(edge_process.pid)
+            attempt = 0
+            while True:
+                attempt += 1
+                edge_process = subprocess.Popen(
+                    [edge_executable, "--inprivate", "--start-maximized", CHATGPT_URL],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.chatgpt_edge_process_id = edge_process.pid
+
+                try:
+                    time.sleep(CHATGPT_START_DELAY_SECONDS)
+                    time.sleep(4.0)
+                    self.activate_edge_element_by_name(
+                        edge_process.pid,
+                        CHATGPT_SIGNUP_BUTTON_TEXT,
+                        timeout_seconds=CHATGPT_STARTUP_GUARD_TIMEOUT_SECONDS,
+                    )
+                    time.sleep(CHATGPT_EMAIL_STEP_DELAY_SECONDS)
+                    release_modifier_keys()
+                    send_unicode_text(email)
+                    press_virtual_key(VK_RETURN)
+                    self.wait_for_chatgpt_initial_next_step(edge_process.pid)
+                    self.start_registration_watch(edge_process.pid)
+                    break
+                except Exception as exc:
+                    try:
+                        self.close_chatgpt_edge_window()
+                    except Exception as close_exc:
+                        self.append_log(
+                            f"ChatGPT startup guard: failed to close Edge after startup failure: {close_exc}"
+                        )
+                    if attempt >= 3:
+                        raise RuntimeError(
+                            f"ChatGPT startup guard failed after {attempt} attempts: {exc}"
+                        ) from exc
+                    self.append_log(
+                        f"ChatGPT startup guard retry {attempt}/3: {exc}. Retrying with the same email."
+                    )
+                    time.sleep(2.0)
         except Exception as exc:
             self.signals.imap_error.emit(f"ChatGPT launch failed: {exc}")
+            if self.reg_automation_active:
+                QTimer.singleShot(
+                    0,
+                    lambda exc_text=str(exc): self.fail_current_iteration(
+                        f"ChatGPT launch failed: {exc_text}"
+                    ),
+                )
             return
 
         self.signals.imap_status.emit(
@@ -2624,6 +3683,13 @@ exit 1
 
     def handle_imap_code_received(self, code: str) -> None:
         self.code_value_input.setText(code)
+
+        if not self.awaiting_registration_code:
+            self.append_log(
+                f"Ignored OpenAI code because no verification step is active yet: {code}"
+            )
+            return
+
         try:
             self.clipboard_text(code)
         except Exception as exc:
@@ -2642,19 +3708,45 @@ exit 1
         self.append_log(f"Received new OpenAI code: {code}")
 
         if self.awaiting_registration_code and code != self.registration_code_baseline:
+            if self.code_submit_in_progress:
+                self.append_log(
+                    f"Ignored duplicate registration code while another code submit is in progress: {code}"
+                )
+                return
+
             pending_flow = self.pending_code_flow
             process_id = self.pending_code_process_id
+            refocus_needed = self.code_wait_refocus_needed
+            clear_before_submit = self.code_wait_clear_before_submit
             self.awaiting_registration_code = False
             self.registration_code_baseline = code
             self.pending_code_flow = ""
             self.pending_code_process_id = 0
+            self.code_submit_in_progress = True
+            self.code_wait_refocus_needed = False
+            self.code_wait_clear_before_submit = False
 
             def insert_code_and_submit() -> None:
                 try:
+                    if pending_flow == "omniroute" and clear_before_submit:
+                        self.focus_and_clear_active_code_field("omniroute")
+                    elif pending_flow == "chatgpt" and clear_before_submit:
+                        self.focus_and_clear_chatgpt_code_field(process_id)
+                    elif refocus_needed:
+                        if pending_flow == "omniroute":
+                            self.focus_active_code_field("omniroute")
+                        elif pending_flow == "chatgpt":
+                            self.focus_active_code_field("chatgpt")
                     self.text_bind_worker(code, "Registration code")
                     time.sleep(0.15)
                     press_virtual_key(VK_RETURN)
                     if pending_flow == "chatgpt":
+                        chatgpt_post_code_state = self.wait_for_chatgpt_post_code_state(
+                            process_id
+                        )
+                        if chatgpt_post_code_state == "invalid_code":
+                            self.handle_chatgpt_invalid_code(process_id)
+                            return
                         self.complete_profile_after_code()
                     elif pending_flow == "omniroute":
                         self.complete_omniroute_after_code(process_id)
@@ -2663,8 +3755,16 @@ exit 1
                         self.signals.omniroute_failed.emit(str(exc))
                         return
                     self.signals.imap_error.emit(f"Code submit failed: {exc}")
+                    if self.reg_automation_active:
+                        QTimer.singleShot(
+                            0,
+                            lambda exc_text=str(exc): self.fail_current_iteration(
+                                f"Code submit failed: {exc_text}"
+                            ),
+                        )
                     return
                 finally:
+                    self.code_submit_in_progress = False
                     if pending_flow == "omniroute":
                         self.signals.omniroute_finished.emit()
 
@@ -2689,6 +3789,7 @@ exit 1
 
 
 def main() -> int:
+    install_global_exception_logging()
     application = QApplication(sys.argv)
     window = CodexApp()
     window.show()

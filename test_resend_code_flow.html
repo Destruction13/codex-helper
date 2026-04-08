@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resend Code Flow Test</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: #171717;
+      color: #f5f5f5;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #1f1f1f;
+    }
+    .card {
+      width: min(540px, calc(100vw - 32px));
+      padding: 32px;
+      border-radius: 24px;
+      background: #202020;
+      border: 1px solid #313131;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+      display: grid;
+      gap: 20px;
+    }
+    h1 {
+      margin: 0;
+      text-align: center;
+      font-size: 46px;
+      line-height: 1.05;
+    }
+    .subtitle {
+      margin: 0;
+      text-align: center;
+      color: #d4d4d4;
+      line-height: 1.5;
+      font-size: 16px;
+    }
+    .email {
+      text-align: center;
+      color: #8ab4ff;
+      font-weight: 700;
+      font-size: 16px;
+    }
+    .markers {
+      display: grid;
+      gap: 8px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: #181818;
+      border: 1px solid #2c2c2c;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      color: #c9d2df;
+    }
+    .countdown {
+      display: grid;
+      place-items: center;
+      gap: 6px;
+      padding: 16px;
+      border-radius: 18px;
+      border: 1px solid #363f52;
+      background: linear-gradient(180deg, #151b26, #10151e);
+    }
+    .countdown-label {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8da0c7;
+    }
+    .countdown-value {
+      font-size: 52px;
+      line-height: 1;
+      font-weight: 800;
+      color: #f5f7fb;
+      font-variant-numeric: tabular-nums;
+    }
+    label {
+      display: grid;
+      gap: 8px;
+      color: #ff5a5a;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    input {
+      height: 58px;
+      border-radius: 18px;
+      border: 2px solid #ff3d3d;
+      background: #1b1b1b;
+      color: #ffffff;
+      font-size: 34px;
+      padding: 0 20px;
+      outline: none;
+      box-sizing: border-box;
+    }
+    .success {
+      color: #3ddc84;
+      font-weight: 700;
+      min-height: 22px;
+    }
+    .primary {
+      height: 58px;
+      border: 0;
+      border-radius: 999px;
+      background: #ffffff;
+      color: #111111;
+      font-size: 30px;
+      cursor: pointer;
+    }
+    .link {
+      text-align: center;
+      color: #ffffff;
+      font-size: 14px;
+    }
+    .link button {
+      color: #ffffff;
+      background: transparent;
+      border: 0;
+      text-decoration: underline;
+      cursor: pointer;
+      font: inherit;
+    }
+    .log {
+      max-height: 180px;
+      overflow: auto;
+      border-top: 1px solid #313131;
+      padding-top: 16px;
+      color: #bcbcbc;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Проверьте свою почту</h1>
+    <p class="subtitle">Введите код подтверждения, который мы только что отправили на</p>
+    <div class="email">ghoulgpt+resend-test@zohomail.eu.</div>
+
+    <div class="markers">
+      <div id="state-marker">STATE: WAITING_CODE</div>
+      <div id="latest-code-marker">LATEST_CODE: NONE</div>
+      <div id="resend-count-marker">RESEND_COUNT: 0</div>
+    </div>
+
+    <div class="countdown">
+      <div class="countdown-label">До повторной отправки</div>
+      <div class="countdown-value" id="countdown-value">30</div>
+    </div>
+
+    <label>
+      Код
+      <input id="code-input" type="text" inputmode="numeric" maxlength="6" autocomplete="off" autofocus>
+    </label>
+
+    <div class="success" id="success-text"></div>
+
+    <button class="primary" id="submit-button">Продолжить</button>
+
+    <div class="link"><button id="resend-button">Отправить электронное письмо повторно</button></div>
+
+    <section class="log" id="event-log"></section>
+  </main>
+
+  <script>
+    const codeInput = document.getElementById('code-input');
+    const submitButton = document.getElementById('submit-button');
+    const resendButton = document.getElementById('resend-button');
+    const successText = document.getElementById('success-text');
+    const eventLog = document.getElementById('event-log');
+    const stateMarker = document.getElementById('state-marker');
+    const latestCodeMarker = document.getElementById('latest-code-marker');
+    const resendCountMarker = document.getElementById('resend-count-marker');
+    const countdownValue = document.getElementById('countdown-value');
+
+    let resendCount = 0;
+    let validCode = null;
+    let countdownSeconds = 30;
+    let countdownTimer = null;
+
+    function makeCode() {
+      return String(Math.floor(100000 + Math.random() * 900000));
+    }
+
+    function log(message) {
+      const timestamp = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+      eventLog.textContent = `[${timestamp}] ${message}\n` + eventLog.textContent;
+    }
+
+    function updateMarkers() {
+      stateMarker.textContent = validCode ? 'STATE: CODE_READY' : 'STATE: WAITING_CODE';
+      latestCodeMarker.textContent = `LATEST_CODE: ${validCode ?? 'NONE'}`;
+      resendCountMarker.textContent = `RESEND_COUNT: ${resendCount}`;
+      document.title = `Resend Code Flow Test - ${validCode ? 'CODE_READY' : 'WAITING_CODE'}`;
+    }
+
+    function updateCountdown() {
+      countdownValue.textContent = String(countdownSeconds);
+    }
+
+    function startCountdown() {
+      if (countdownTimer) {
+        window.clearInterval(countdownTimer);
+      }
+      countdownSeconds = 30;
+      updateCountdown();
+      countdownTimer = window.setInterval(() => {
+        countdownSeconds -= 1;
+        updateCountdown();
+      }, 1000);
+    }
+
+    function resetFlow() {
+      resendCount = 0;
+      validCode = null;
+      codeInput.value = '';
+      successText.textContent = '';
+      updateMarkers();
+      startCountdown();
+      log('Сценарий сброшен. Код пока не приходит, поле уже в фокусе.');
+      codeInput.focus();
+    }
+
+    function resendCode() {
+      resendCount += 1;
+      validCode = makeCode();
+      updateMarkers();
+      resendButton.focus();
+      log(`Нажата повторная отправка. Попытка #${resendCount}. Новый код: ${validCode}`);
+    }
+
+    function submitCode() {
+      const submitted = codeInput.value.trim();
+      log(`Пользователь отправил код ${submitted || '<пусто>'}`);
+
+      if (!validCode) {
+        log('Код ещё не пришёл.');
+        return;
+      }
+
+      if (submitted !== validCode) {
+        log('Код не совпал с выданным.');
+        return;
+      }
+
+      successText.textContent = 'Код принят. Resend-сценарий отработал успешно.';
+      if (countdownTimer) {
+        window.clearInterval(countdownTimer);
+      }
+      log('Код принят.');
+    }
+
+    submitButton.addEventListener('click', submitCode);
+    resendButton.addEventListener('click', resendCode);
+    codeInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitCode();
+      }
+    });
+
+    resetFlow();
+  </script>
+</body>
+</html>
